@@ -1,37 +1,52 @@
 import asyncio
 import aiohttp
-import orjson  # or ujson — faster than the built-in json
+import orjson
 
-# Tunable concurrency limit; start around 100-500 and benchmark
-SEMAPHORE_LIMIT = 300
+SEMAPHORE_LIMIT = 300  # Tune this based on bandwidth & server limits
 
-async def fetch_value(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore):
+async def fetch_barcodes(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore):
     json_url = url.rstrip('/') + '.json'
-    async with sem:  # bound total concurrency
+    async with sem:
         async with session.get(json_url) as resp:
             resp.raise_for_status()
             payload = await resp.read()
-    # Parse once, then extract the key you care about:
-    data = orjson.loads(payload)
-    return data['someNestedKey']  # adjust to your path
+
+    try:
+        data = orjson.loads(payload)
+        variants = data["product"]["variants"]
+        barcodes = [v["barcode"] for v in variants if v.get("barcode")]
+
+        # Return str if only one, else list
+        if len(barcodes) == 1:
+            return barcodes[0]
+        return barcodes if barcodes else None
+    except Exception as e:
+        # Log or handle error (optional)
+        return None
 
 async def main(urls):
     sem = asyncio.Semaphore(SEMAPHORE_LIMIT)
-    # Use a single session for connection reuse + keep-alive
     timeout = aiohttp.ClientTimeout(total=30)
-    conn = aiohttp.TCPConnector(limit=0, enable_http2=True)  # unlimited conn, use HTTP/2
+    conn = aiohttp.TCPConnector(limit=0, enable_http2=True)
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
-        tasks = [fetch_value(session, u, sem) for u in urls]
-        # Gather in batches to avoid huge spike of coroutines
+        tasks = [fetch_barcodes(session, url, sem) for url in urls]
+
         results = []
-        BATCH = 10_000
-        for i in range(0, len(tasks), BATCH):
-            batch = tasks[i:i + BATCH]
+        BATCH_SIZE = 10000
+        for i in range(0, len(tasks), BATCH_SIZE):
+            batch = tasks[i:i + BATCH_SIZE]
             results.extend(await asyncio.gather(*batch, return_exceptions=True))
+
         return results
 
-if __name__ == '__main__':
-    import sys
-    urls = sys.stdin.read().splitlines()   # or however you load them
-    values = asyncio.run(main(urls))
-    # post-process values here (filter out errors, etc.)
+if __name__ == "__main__":
+    # Example list of URLs
+    urls = [
+        "https://example.com/products/medela-magnetronsterilisatiezakje-quick-clean-5-stuks",
+        # Add thousands/lakhs here
+    ]
+
+    barcodes = asyncio.run(main(urls))
+
+    for i, bc in enumerate(barcodes):
+        print(f"{i+1}: {bc}")
