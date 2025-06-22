@@ -4,44 +4,34 @@ import orjson
 import random
 from aiolimiter import AsyncLimiter
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
-RATE_LIMIT_CALLS = 10        # max requests
-RATE_LIMIT_PERIOD = 1.0      # per N seconds
-MAX_CONCURRENCY = 100        # max in-flight requests
+# CONFIG
+RATE_LIMIT_CALLS = 10
+RATE_LIMIT_PERIOD = 1.0
+MAX_CONCURRENCY = 20
 MAX_RETRIES = 5
-INITIAL_BACKOFF = 0.5        # seconds
-# ──────────────────────────────────────────────────────────────────────────
+INITIAL_BACKOFF = 0.5
 
-async def fetch_with_retries(session: aiohttp.ClientSession, json_url: str):
+async def fetch_with_retries(session, json_url):
     backoff = INITIAL_BACKOFF
     for attempt in range(1, MAX_RETRIES + 1):
         async with session.get(json_url) as resp:
             if resp.status == 429:
-                # honor Retry-After header if present
                 retry_after = resp.headers.get("Retry-After")
                 wait = float(retry_after) if retry_after else backoff
-                # add a little jitter
                 await asyncio.sleep(wait + random.uniform(0, backoff * 0.1))
                 backoff *= 2
                 continue
-
             resp.raise_for_status()
             payload = await resp.read()
             data = orjson.loads(payload)
-            variants = data["product"]["variants"]
-            barcodes = [v["barcode"] for v in variants if v.get("barcode")]
-
-            if len(barcodes) == 1:
-                return barcodes[0]
-            return barcodes or None
-
-    # gave up after retries
+            barcodes = [v["barcode"] for v in data["product"]["variants"] if v.get("barcode")]
+            return barcodes[0] if len(barcodes) == 1 else barcodes or None
     return None
 
 async def fetch_barcodes(session, url, limiter, sem):
     json_url = url.rstrip('/') + '.json'
-    async with limiter:      # enforce rate limit
-        async with sem:      # enforce concurrency limit
+    async with limiter:
+        async with sem:
             return await fetch_with_retries(session, json_url)
 
 async def main(urls):
@@ -53,21 +43,18 @@ async def main(urls):
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         tasks = [fetch_barcodes(session, url, limiter, sem) for url in urls]
-        # run them all, collecting results (exceptions are returned)
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        task_to_url = dict(zip(tasks, urls))  # for printing with URL
 
-if __name__ == "__main__":
-    import sys
+        results = []
+        for idx, task in enumerate(asyncio.as_completed(tasks), start=1):
+            try:
+                result = await task
+                url = task_to_url[task]
+                print(f"[{idx}/{len(urls)}] ✅ {url} → {result}")
+                results.append(result)
+            except Exception as e:
+                url = task_to_url.get(task, "unknown")
+                print(f"[{idx}/{len(urls)}] ❌ {url} → ERROR: {e}")
+                results.append(None)
 
-    # load URLs (one per line) from stdin or a file
-    if len(sys.argv) > 1:
-        with open(sys.argv[1]) as f:
-            urls = [line.strip() for line in f if line.strip()]
-    else:
-        urls = sys.stdin.read().splitlines()
-
-    results = asyncio.run(main(urls))
-
-    # Output: index, URL, barcode(s)
-    for idx, (url, bc) in enumerate(zip(urls, results), start=1):
-        print(f"{idx}. {url} → {bc}")
+        return results
